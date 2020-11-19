@@ -11,6 +11,25 @@ from torch.autograd import Variable
 from torch.nn import functional as F
 # from pytorch_pretrained_bert import BertAdam
 from transformers import AdamW, get_linear_schedule_with_warmup
+import copy
+
+class Discriminator(nn.Module):
+
+    def __init__(self, hidden_size=230, num_labels=2):
+        nn.Module.__init__(self)
+        self.hidden_size = hidden_size
+        self.num_labels = num_labels
+        self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.relu1 = nn.ReLU()
+        self.drop = nn.Dropout()
+        self.fc2 = nn.Linear(hidden_size, 2)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu1(x)
+        x = self.drop(x)
+        logits = self.fc2(x)
+        return logits
 
 def warmup_linear(global_step, warmup_step):
     if global_step < warmup_step:
@@ -232,7 +251,7 @@ class FewShotREFramework:
             
             # Adv part
             if self.adv:
-                support_adv = next(self.adv_data_loader)
+                support_adv, _, _ = next(self.train_data_loader)
                 if torch.cuda.is_available():
                     for k in support_adv:
                         support_adv[k] = support_adv[k].cuda()
@@ -256,6 +275,7 @@ class FewShotREFramework:
                 loss_encoder = self.adv_cost(dis_logits, 1 - dis_labels)
     
                 loss_encoder.backward(retain_graph=True)
+                #optimizer_dis.step()
                 optimizer_encoder.step()
                 optimizer_dis.zero_grad()
                 optimizer_encoder.zero_grad()
@@ -299,7 +319,13 @@ class FewShotREFramework:
             eval_iter,
             na_rate=0,
             pair=False,
-            ckpt=None): 
+            ckpt=None,
+            pytorch_optim=optim.SGD,
+            adv_enc_lr=1e-1,
+            adv_dis_lr=2e-1,
+            learning_rate=1e-1,
+            weight_decay=1e-5,
+            lr_step_size=10000): 
         '''
         model: a FewShotREModel instance
         B: Batch size
@@ -316,21 +342,76 @@ class FewShotREFramework:
         if ckpt is None:
             print("Use val dataset")
             eval_dataset = self.val_data_loader
+
+            iter_right = 0.0
+            iter_sample = 0.0
+            with torch.no_grad():
+                for it in range(eval_iter):
+                    if pair:
+                        batch, label = next(eval_dataset)
+                        if torch.cuda.is_available():
+                            for k in batch:
+                                batch[k] = batch[k].cuda()
+                            label = label.cuda()
+                        logits, pred = model(batch, N, K, Q * N + Q * na_rate)
+                    else:
+                        support, query, label = next(eval_dataset)
+                        if torch.cuda.is_available():
+                            for k in support:
+                                support[k] = support[k].cuda()
+                            for k in query:
+                                query[k] = query[k].cuda()
+                            label = label.cuda()
+                        logits, pred = model(support, query, N, K, Q * N + Q * na_rate)
+
+                    right = model.accuracy(pred, label)
+                    iter_right += self.item(right.data)
+                    iter_sample += 1
+
+                    sys.stdout.write('[EVAL] step: {0:4} | accuracy: {1:3.2f}%'.format(it + 1, 100 * iter_right / iter_sample) + '\r')
+                    sys.stdout.flush()
+                print("")
+            return iter_right / iter_sample
+
         else:
             print("Use test dataset")
+            
             if ckpt != 'none':
                 state_dict = self.__load_model__(ckpt)['state_dict']
                 own_state = model.state_dict()
-                for name, param in state_dict.items():
-                    if name not in own_state:
-                        continue
-                    own_state[name].copy_(param)
+                #for name, param in state_dict.items():
+                    #if name not in own_state:
+                        #continue
+                    #own_state[name].copy_(param)
+            d_origin = Discriminator(230)
+            d_origin = copy.deepcopy(self.d)
             eval_dataset = self.test_data_loader
+            '''
+            optimizer = pytorch_optim(model.parameters(), learning_rate, weight_decay=weight_decay)
+            optimizer_encoder = pytorch_optim(model.parameters(), lr=adv_enc_lr)
+            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=lr_step_size)
+            optimizer_dis = pytorch_optim(self.d.parameters(), lr=adv_dis_lr)
+            model.train()
+            self.d.train()
+            '''
+            iter_right = 0.0
+            iter_sample = 0.0
 
-        iter_right = 0.0
-        iter_sample = 0.0
-        with torch.no_grad():
             for it in range(eval_iter):
+                if ckpt != 'none':
+                    for name, param in state_dict.items():
+                        if name not in own_state:
+                            continue
+                        own_state[name].copy_(param)
+                self.d = copy.deepcopy(d_origin)
+                optimizer = pytorch_optim(model.parameters(), learning_rate, weight_decay=weight_decay)
+                optimizer_encoder = pytorch_optim(model.parameters(), lr=adv_enc_lr)
+                scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=lr_step_size)
+                optimizer_dis = pytorch_optim(self.d.parameters(), lr=adv_dis_lr)
+                model.train()
+                self.d.train()
+
+
                 if pair:
                     batch, label = next(eval_dataset)
                     if torch.cuda.is_available():
@@ -346,13 +427,66 @@ class FewShotREFramework:
                         for k in query:
                             query[k] = query[k].cuda()
                         label = label.cuda()
-                    logits, pred = model(support, query, N, K, Q * N + Q * na_rate)
 
-                right = model.accuracy(pred, label)
+                    iter_loss_dis = 0.0
+                    iter_right_dis = 0.0
+                    adv_right = 0.0
+                    for it_adv in range(25):
+                        support_adv, query_adv, label_adv = next(self.train_data_loader)
+                        if torch.cuda.is_available():
+                            for k in support_adv:
+                                support_adv[k] = support_adv[k].cuda()
+                            for k in query_adv:
+                                query_adv[k] = query_adv[k].cuda()
+                            label_adv = label_adv.cuda()
+
+                        logits_adv, pred_adv = model(support_adv, query_adv, N, K, Q * N + Q * na_rate)
+                        loss_adv = model.loss(logits_adv, label_adv)
+                        right_adv = model.accuracy(pred_adv, label_adv)
+                        loss_adv.backward()
+
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad()
+                        
+                        features_ori = model.sentence_encoder(support)
+                        features_adv = model.sentence_encoder(support_adv)
+                        features = torch.cat([features_ori, features_adv], 0)
+                        total = features.size(0)
+                        dis_labels = torch.cat([torch.zeros((total // 2)).long().cuda(),
+                            torch.ones((total // 2)).long().cuda()], 0)
+                        dis_logits = self.d(features)
+                        loss_dis = self.adv_cost(dis_logits, dis_labels)
+                        _, pred = dis_logits.max(-1)
+                        right_dis = float((pred == dis_labels).long().sum()) / float(total)
+
+                        loss_dis.backward(retain_graph=True)
+                        optimizer_dis.step()
+                        optimizer_dis.zero_grad()
+                        optimizer_encoder.zero_grad()
+
+                        loss_encoder = self.adv_cost(dis_logits, 1 - dis_labels)
+
+                        loss_encoder.backward(retain_graph=True)
+                        optimizer_encoder.step()
+                        optimizer_dis.zero_grad()
+                        optimizer_encoder.zero_grad()
+
+                        iter_loss_dis += self.item(loss_dis.data)
+                        iter_right_dis += right_dis
+
+                        logits, pred = model(support, query, N, K, Q * N + Q * na_rate)
+                        right = model.accuracy(pred, label)
+                        adv_right += self.item(right.data)
+                        #if it_adv + 1 == 1:
+                            #print("Start Accuracy:")
+                            #print(adv_right)
+                        #sys.stdout.write('[ADV] step: {0:4} | accuracy: {1:3.2f}%, dis_loss: {2:2.6f}, dis_acc: {3:2.6f}'.format(it_adv + 1, 100 * adv_right / (it_adv + 1), iter_loss_dis / (it_adv + 1), 100 * iter_right_dis / (it_adv + 1)) + '\r')
+
                 iter_right += self.item(right.data)
                 iter_sample += 1
 
                 sys.stdout.write('[EVAL] step: {0:4} | accuracy: {1:3.2f}%'.format(it + 1, 100 * iter_right / iter_sample) + '\r')
                 sys.stdout.flush()
             print("")
-        return iter_right / iter_sample
+            return iter_right / iter_sample
